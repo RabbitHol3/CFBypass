@@ -1,10 +1,8 @@
 # CFBypass
 
-Este é um projeto de estudo de como contornar o Cloudflare cookies.
+This is a simple study case generate to cf_clearance cookie to bypass Cloudflare protection.
 
-## Dependências
-Este projeto usa as seguintes dependências:
-
+# dependences
 - axios
 - axios-cookiejar-support
 - moment
