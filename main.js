@@ -1,153 +1,201 @@
 const axios = require('axios');
-const consts = require('./consts');
 const { wrapper } = require('axios-cookiejar-support');
 const { CookieJar } = require('tough-cookie');
-const tls = require('tls');
-const puppeteer = require('puppeteer-extra')
-const StealthPlugin = require('puppeteer-extra-plugin-stealth');
-const { executablePath } = require('puppeteer');
-let wp_encrypter = require('./wp_encrypter');
 const captcha_solver = require('./captcha_solver');
+const { getCloudflareCookies } = require('./cf_bypasser');
+const cheerio = require('cheerio');
+const { assert } = require('puppeteer');
 
+const baseUrl = 'https://hortolandia.consultacidadao.com.br';
+const cfWebsiteKey = '0x4AAAAAAAbRWU6g1TGKS2Wl';
+const cfAction = 'consulta-multas-2951';
 
-class CloudflareBypasser{
-    constructor(session, baseUrl) {
-        this.session = session;
-        this.baseUrl = baseUrl;
-        this.userAgent = session.defaults.headers.common["User-Agent"]
-        this.baseData = consts.consultacidadao_cf_base_data(this.userAgent, baseUrl);
-        this.cfRay = null;
-        this.s = null;
-        this.key = null;
-    }
-
-    async getCfRay() {
-        // using puppeteer to get the cf-ray
-        // i tried to get the cf-ray using axios but it was not working
-        await puppeteer.launch(
-            { 
-                headless: false,
-                executablePath: executablePath(),
-
-             }
-        ).then(async browser => {
-            // cf-ray is recieved after the first request
-            // so we need to intercept the first request
-            // and get the cf-ray from the response headers
-            browser.on('targetcreated', async target => {
-                const page = await target.page();
-                if (!page) {
-                    return;
-                }
-                page.on('response', async response => {
-                    if (response.url().startsWith(this.baseUrl)) {
-                        this.cfRay = response.headers()['cf-ray'];
-                        // close browser
-                        // and ignore if any error when closing
-                        try {
-                            await browser.close();
-                        } catch (error) {
-                            console.error(error);
-                        }
-                    }
-                });
-            });
-            const page = await browser.newPage();
-            await page.goto(this.baseUrl);
-        })
-    }
-
-    async getValues() {
-        // https://hortolandia.consultacidadao.com.br/cdn-cgi/challenge-platform/h/g/scripts/jsd/6aac8896f227/main.js
-        const response = await this.session.get(
-            `${this.baseUrl}/cdn-cgi/challenge-platform/h/g/scripts/jsd/6aac8896f227/main.js`,
-            // "https://www.google.com/",
-        );
-        if (response.status !== 200) {
-            throw new Error('Failed to fetch main.js');
-        }
-
-        const soup = response.data.split('ah=\'')[1].split('\'.split(')[0];
-        for (const x of soup.split(',')) {
-            if (x.length === 65 && !x.includes('=')) {
-                this.key = x;
+async function parseMultas(html) {
+    const $ = cheerio.load(html);
+    const tables = [];
+    $('table').each((i, table) => {
+        const headers = [];
+        $(table).find('thead tr th').each((j, th) => {
+            const header = $(th).text().trim();
+            if (header) {
+                headers.push(header);
+            } else {
+                headers.push(null); // mantém a ordem das colunas
             }
-        }
-        const regex_pattern = /.*0\.(\d{12,20}):(\d{10}):([a-zA-Z0-9_+*\\-]{43}).*/;
-        const x = soup.match(regex_pattern);
-        // const s = '0.' + x[0].join(':');
-        this.s = `0.${x[1]}:${x[2]}:${x[3]}`;
+        });
 
-        if (!this.key) {
-            soup = soup.replace(s, '');
-            this.key = soup.split(',').find(x => x.includes('-') && x.length > 20);
-        }
+        if (headers.filter(Boolean).length <= 1) return; // ignora tabelas sem cabeçalho
+
+        const tableData = [];
+        $(table).find('tbody tr').each((j, row) => {
+            const rowData = {};
+            $(row).find('td').each((k, cell) => {
+                const button = $(cell).find('button');
+                if (headers[k] || button.length) { // ignora colunas sem cabeçalho
+                    if (button.length) {
+                        // Captura o evento de clique do botão
+                        // Nele contem os dados necessários para 
+                        // fazer a requisição de detalhes da multa
+                        // visualizaAutoInfracao(orgao, ait, digito)                        
+                        regex = /visualizaAutoInfracao\((\d+),\s*'([^']*)',\s*'([^']*)'\)/;
+                        match = button.attr('onclick').match(regex);
+                        if (match) {             
+                            rowData['detalhes'] = {
+                                orgao: match[1],
+                                ait: match[2],
+                                digito: match[3]
+                            };
+                        }
+                    } else {
+                        rowData[headers[k]] = $(cell).text().trim();
+                    }
+                }
+            });
+            if (Object.keys(rowData).length) tableData.push(rowData);
+        });
+
+        if (tableData.length) tables.push(tableData);
+    });
+    return tables[0];
+    
+    
+
+}
+
+async function extractTrafficViolationData(html) {
+
+    const css_paths = {
+        placa : 'table > tbody > tr:nth-child(1) > td > table > tbody > tr:nth-child(2) > td:nth-child(1)',
+        data : 'table > tbody > tr:nth-child(1) > td > table > tbody > tr:nth-child(2) > td:nth-child(2)',
+        local : 'table > tbody > tr:nth-child(1) > td > table > tbody > tr:nth-child(2) > td:nth-child(3)',
+        codigo : 'table > tbody > tr:nth-child(3) > td > table > tbody > tr:nth-child(2) > td:nth-child(1)',
+        descricao : 'table > tbody > tr:nth-child(3) > td > table > tbody > tr:nth-child(2) > td:nth-child(2)',
+        observacao: 'table > tbody > tr:nth-child(6) > td',
     }
 
-    async getEncryptedWp(data) {
-        const str_data = JSON.stringify(data);
-        return wp_encrypter.encrypt(str_data, this.key);
-    }
+    const $ = cheerio.load(html);
+    
+    const infracao = {};
 
-    async getCookies() {
-        const payload = {
-            'wp' : await this.getEncryptedWp(this.baseData),
-            's' : this.s,
-        }
-        // this request will set the cookies
-        // and we will be able to make the final request
-        await this.session.post(
-            `${this.baseUrl}/cdn-cgi/challenge-platform/h/g/jsd/r/${this.cfRay}`,
-            payload,
-        ).then(response => {
-            console.log(response.data);
+    // Extract the Auto de Infração de Trânsito number
+    infracao.numero = $('div.mainContent h3').text().split(': ')[1];
+    infracao.placa = $(css_paths.placa).text().trim();
+    infracao.data = $(css_paths.data).text().trim();
+    infracao.local = $(css_paths.local).text().trim();
+    infracao.codigo = $(css_paths.codigo).text().trim();
+    infracao.descricao = $(css_paths.descricao).text().trim();
+    infracao.observacao = $(css_paths.observacao).text().trim();
+    return infracao
+}
+
+async function consultaPlaca(session, placa, renavam, captchaToken) {
+    const uri = '/consultaMultas/consulta';
+    const data = {
+        param1: renavam,
+        param2: placa,
+        "cf-turnstile-response": captchaToken
+    };
+    
+    const body = Object.keys(data).map(key => key + '=' + data[key]).join('&');
+    
+    const cf_clearance = session.defaults.jar.store.idx['consultacidadao.com.br']['/'].cf_clearance.value
+
+    response = await fetch("https://hortolandia.consultacidadao.com.br/consultaMultas/consulta", {
+        "headers": {
+          "content-type": "application/x-www-form-urlencoded; charset=UTF-8",
+          "cookie": "PHPSESSID-web-2=id5oaopmo15nov34p13ovm3g98; __utma=195548853.873603165.1719084086.1719084086.1719084086.1; __utmb=195548853.0.10.1719084086; __utmc=195548853; __utmz=195548853.1719084086.1.1.utmcsr=(direct)|utmccn=(direct)|utmcmd=(none); cf_clearance=" + cf_clearance,
+        },
+        "body": "param1=01216271094&param2=FTB7868&cf-turnstile-response=" + captchaToken,
+        "method": "POST"
+      })
+    
+    if (response.status !== 200) {
+        throw new Error(`Erro ao consultar multas: ${response.status
+        }`);
+    }
+    const html = await response.text();
+    multas = await parseMultas(html);
+    return multas
+    // if 
+
+}
+
+async function multaDetalhes(cf_clearance, orgao, ait, digito) {
+
+    if (!cf_clearance) {
+        throw new Error('⚠️ cf_clearance cookie não encontrado 🍪');
+    }
+    
+    const body =`orgao=${orgao}&ait=${ait}&digito=${digito}`
+    response = await fetch("https://hortolandia.consultacidadao.com.br/consultaMultas/visualizarMulta",
+        {
+            "headers": {
+                "content-type": "application/x-www-form-urlencoded; charset=UTF-8",
+                "cookie": "cf_clearance=" + cf_clearance,
+            },
+            "body": body,
+            "method": "POST"
         })
-
+    if (response.status !== 200) {
+        throw new Error(`Erro ao consultar multas: ${response.status
+        }`);
     }
+    const html = await response.text();
+    const dados = await extractTrafficViolationData(html);
+    return dados
 
 }
+(async() =>{
+        
+    const jar = new CookieJar();
+    let session = wrapper(axios.create({ jar }));
+    session.defaults.headers.common = {
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7", 
+        "Accept-Encoding": "gzip, deflate, br, zstd", 
+        "Accept-Language": "en-US,en;q=0.9,pt;q=0.8", 
+        "Dnt": "1", 
+        "Priority": "u=0, i", 
+        "Sec-Ch-Ua": "\"Google Chrome\";v=\"125\", \"Chromium\";v=\"125\", \"Not.A/Brand\";v=\"24\"", 
+        "Sec-Ch-Ua-Mobile": "?0", 
+        "Sec-Ch-Ua-Platform": "\"Windows\"", 
+        "Sec-Fetch-Dest": "document", 
+        "Sec-Fetch-Mode": "navigate", 
+        "Sec-Fetch-Site": "cross-site", 
+        "Sec-Fetch-User": "?1", 
+        "Upgrade-Insecure-Requests": "1", 
+        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "X-Amzn-Trace-Id": "Root=1-6670d00a-54c9c6f5774e524964ce24d1"
+      }
 
-const jar = new CookieJar();
-const session = wrapper(axios.create({ jar }));
-
-// set headers
-session.defaults.headers.common = {
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7", 
-    "Accept-Encoding": "gzip, deflate, br, zstd", 
-    "Accept-Language": "en-US,en;q=0.9,pt;q=0.8", 
-    "Dnt": "1", 
-    "Priority": "u=0, i", 
-    "Sec-Ch-Ua": "\"Google Chrome\";v=\"125\", \"Chromium\";v=\"125\", \"Not.A/Brand\";v=\"24\"", 
-    "Sec-Ch-Ua-Mobile": "?0", 
-    "Sec-Ch-Ua-Platform": "\"Windows\"", 
-    "Sec-Fetch-Dest": "document", 
-    "Sec-Fetch-Mode": "navigate", 
-    "Sec-Fetch-Site": "cross-site", 
-    "Sec-Fetch-User": "?1", 
-    "Upgrade-Insecure-Requests": "1", 
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/114.0.0.0 Safari/537.36",
-    "X-Amzn-Trace-Id": "Root=1-6670d00a-54c9c6f5774e524964ce24d1"
-  }
-
-
-async function getCloudflareCookies(session, baseUrl) {
-    const bypasser = new CloudflareBypasser(session, baseUrl);
-    // console.log(bypasser.session.defaults.jar.store.idx)
-    await bypasser.getValues();
-    await bypasser.getCfRay();
-    await bypasser.getCookies();
-    // console.log(bypasser.session.defaults.jar.store.idx)
-}
-
-(async() =>{    
-    // get the cookies
-    let baseUrl = 'https://hortolandia.consultacidadao.com.br';
-    let cfWebsiteKey = '0x4AAAAAAAbRWU6g1TGKS2Wl'
-    let cfAction = 'consulta-multas-2951'
+    console.log(`🍪 Validando cookies para ${baseUrl} ...`);
 
     await getCloudflareCookies(session, baseUrl);
+    cf_clearance = session.defaults.jar.store.idx['consultacidadao.com.br']['/'].cf_clearance.value
+    if (!cf_clearance) {
+        throw new Error('⚠️ cf_clearance cookie não encontrado 🍪');
+    }
+    console.log(`✅ Cookies validados com sucesso!\n`);
+    // Apartir daqui já temos os cookies necessários para fazer as requisições
+    // Agora vamos fazer a requisição para obter as multas
+    console.log('>>> Executando requisição para obter detalhes da multa...');    
+    //orgao="2951", ait="S00196930", digito="1"
+    const dados = await multaDetalhes(cf_clearance, "2951", "S00196930", "1")
+    console.log(dados )     
     
-    // make your requests now using the session
-    const cf_token = await captcha_solver.cfTurnstile(cfWebsiteKey, baseUrl, cfAction)
     
+    // Caso a requisição necessite de validar o captcha, a função abaixo pode ser utilizada
+    console.log('\n ############# Validando captcha #############');    
+    const solution = await captcha_solver.cfTurnstile(cfWebsiteKey, baseUrl, cfAction)
+    console.log('🔑 Token:', solution.token);
+
+    // Compara userAgent, caso seja diferente, atualiza
+    if (session.defaults.headers.common['User-Agent'] !== solution.userAgent) {
+        session.defaults.headers.common['User-Agent'] = solution.userAgent;
+    }
+    // Agora faz as requisições necessárias
+    console.log('\n Executando requisição para obter multas, com captcha validado e cookies atualizados...');
+    resultado = await consultaPlaca(session, 'FTB7868', '01216271094', solution.token);
+    for (const multa of resultado) {
+        console.log(multa);
+    }
 })();
