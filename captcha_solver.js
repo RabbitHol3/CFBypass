@@ -23,7 +23,7 @@ async function cfTurnstile(websiteKey, websiteURL, action) {
 
   try {
     // const res = await axios.post("https://api.rilckz.com/captcha/tasks/", payload, request_config);
-    const res = await axios.post("https://api.rilckz.com/captcha/tasks/", payload, request_config);
+    const res = await axios.post("http://api.rilckz.com/captcha/tasks/", payload, request_config);
     const task_id = res.data.taskId;
     if (!task_id) {
       console.log("Falhou ao criar task:", res.data);
@@ -35,11 +35,10 @@ async function cfTurnstile(websiteKey, websiteURL, action) {
     while (true) {
       await new Promise(resolve => setTimeout(resolve, 1000)); // Delay for 1 second
 
-      const resp = await axios({
-        method: "GET",
-        url: `https://api.rilckz.com/captcha/tasks/${task_id}`,
-        headers: request_config.headers
-      })
+      const resp = await axios.get(
+        `http://api.rilckz.com/captcha/tasks/${task_id}`,
+        request_config
+      )
       const status = resp.data.status;
 
       if (status === "ready") {
